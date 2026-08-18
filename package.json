@@ -1,0 +1,23 @@
+{
+  "name": "community-kreaturen",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "bot": "node service/feed-bot.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "next": "14.2.35",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "socket.io-client": "^4.8.3",
+    "thirdweb": "5.68.0"
+  },
+  "devDependencies": {
+    "@openzeppelin/contracts": "^5.6.1",
+    "cross-spawn": "^7.0.6"
+  }
+}
