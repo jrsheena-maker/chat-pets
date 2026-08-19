@@ -178,15 +178,21 @@ async function lookupTokenFromChain(walletAddress) {
 }
 
 // --- Ein Ei anhand der Wallet-Adresse finden und füttern ---
-// Gibt bei Erfolg { tokenId, level } zurück (Level NACH dem Füttern).
-async function feedWallet(walletAddress) {
+// Gibt bei Erfolg { tokenId, predictedLevel, confirmedLevel, tierChanged } zurück.
+//
+// onPredicted(...) wird SOFORT aufgerufen, sobald wir wissen, welches Level
+// das Ei gleich haben wird - eine reine lokale Vorhersage (letzter bekannter
+// Stand + 1), NICHT durch Nachschauen auf der Chain. So kann der Aufrufer
+// (die Chat-Bestätigung) sofort reagieren, ohne auf die Blockchain zu warten.
+// Die eigentliche Bestätigung/Korrektur passiert erst danach, im Rückgabewert.
+async function feedWallet(walletAddress, { onPredicted } = {}) {
   let cached = getCachedToken(walletAddress);
 
   if (!cached) {
     // Erstes Füttern dieser Wallet seit es den Cache gibt: einmalig auf der
     // Chain nachschauen. Ab jetzt merken wir uns Token-ID + Level lokal und
     // müssen nie wieder danach suchen - das spart die zwei langsamsten
-    // Schritte bei jeder weiteren Fütterung.
+    // Schritte bei jeder weiteren Fütterung UND macht die Vorhersage möglich.
     const found = await lookupTokenFromChain(walletAddress);
     if (!found) {
       console.log(`   ⚠ Keine Token-ID für Wallet ${walletAddress} gefunden - übersprungen.`);
@@ -195,6 +201,12 @@ async function feedWallet(walletAddress) {
     cached = found;
     setCachedToken(walletAddress, cached.tokenId, cached.level);
   }
+
+  const previousLevel = cached.level;
+  const predictedLevel = previousLevel + 1;
+
+  // Vorhersage sofort raus - noch bevor die Transaktion überhaupt gesendet wird.
+  onPredicted?.({ tokenId: cached.tokenId, predictedLevel });
 
   const transaction = prepareContractCall({
     contract: eggContract,
@@ -223,12 +235,12 @@ async function feedWallet(walletAddress) {
   console.log(`   ✅ Ei #${cached.tokenId} gefüttert. Tx: ${result.transactionHash}`);
 
   // Level lokal hochzählen statt nochmal von der Chain zu lesen - wir sind
-  // die Einzigen, die feed() aufrufen dürfen, kennen den neuen Stand also sicher.
-  const previousLevel = cached.level;
-  const level = bumpCachedLevel(walletAddress);
-  const tierChanged = spriteTier(previousLevel) !== spriteTier(level);
+  // die Einzigen, die feed() aufrufen dürfen, kennen den neuen Stand also
+  // sicher. Im Normalfall ist das exakt die Vorhersage von oben.
+  const confirmedLevel = bumpCachedLevel(walletAddress);
+  const tierChanged = spriteTier(previousLevel) !== spriteTier(confirmedLevel);
 
-  return { tokenId: cached.tokenId, level, tierChanged };
+  return { tokenId: cached.tokenId, predictedLevel, confirmedLevel, tierChanged };
 }
 
 // Muss zu app/overlay/page.js's spriteForLevel()-Stufen passen (🥚 -> 🐣 -> 🐥).
@@ -264,35 +276,45 @@ async function handleChatMessage(payload) {
     }
     console.log(`🍗 ${sender.username} füttert sein Ei (Wallet ${wallet})...`);
 
-    // Sofortige Reaktion fürs Overlay - noch BEVOR die Transaktion überhaupt
-    // losgeschickt wird. Nur möglich, wenn wir die Token-ID schon kennen
-    // (bei der allerersten Fütterung einer Wallet noch nicht - dann taucht
-    // die Kreatur erst nach der Bestätigung ganz normal auf).
-    const cachedForInstantReaction = getCachedToken(wallet);
-    if (cachedForInstantReaction) {
-      appendLiveEvent({
-        type: "feed-attempt",
-        tokenId: cachedForInstantReaction.tokenId,
-        walletAddress: wallet,
-      });
-    }
+    // Wird direkt bei feedWallet() aufgerufen, sobald die Vorhersage feststeht
+    // (bevor die Transaktion überhaupt gesendet wird): sofortige Overlay-
+    // Reaktion + sofortige Chat-Bestätigung mit dem vorhergesagten Level.
+    // Bewusst NICHT awaited (sendChatMessage läuft im Hintergrund weiter) -
+    // sonst würde das Warten auf die Chat-API die Vorhersage wieder verzögern.
+    const handlePrediction = ({ tokenId, predictedLevel }) => {
+      appendLiveEvent({ type: "feed-attempt", tokenId, walletAddress: wallet });
+      sendChatMessage(`🥚 ${sender.username}'s egg is now Level ${predictedLevel}!`);
+    };
 
     try {
-      const fed = await feedWallet(wallet);
+      const fed = await feedWallet(wallet, { onPredicted: handlePrediction });
       if (fed) {
-        recordFeed(fed.tokenId, wallet, fed.level);
-        await sendChatMessage(`🥚 ${sender.username}'s egg is now Level ${fed.level}!`);
+        recordFeed(fed.tokenId, wallet, fed.confirmedLevel);
+
+        // Normalfall: Vorhersage stimmte - keine weitere Nachricht nötig.
+        // Nur bei einer (seltenen) Abweichung wird im Chat korrigiert.
+        if (fed.confirmedLevel !== fed.predictedLevel) {
+          await sendChatMessage(
+            `↩️ Correction: ${sender.username}'s egg is actually Level ${fed.confirmedLevel}.`
+          );
+        }
+
         if (fed.tierChanged) {
           appendLiveEvent({
             type: "level-up",
             tokenId: fed.tokenId,
             walletAddress: wallet,
-            newLevel: fed.level,
+            newLevel: fed.confirmedLevel,
           });
         }
       }
     } catch (error) {
       console.error(`   ❌ Füttern fehlgeschlagen:`, error.message || error);
+      // Wir haben schon eine (jetzt falsche) Vorhersage in den Chat geschickt -
+      // das muss richtiggestellt werden, sonst wirkt es als wäre gefüttert worden.
+      await sendChatMessage(
+        `⚠️ Sorry ${sender.username}, feeding your egg failed. Please try "!feed" again.`
+      );
     }
   }
 }
